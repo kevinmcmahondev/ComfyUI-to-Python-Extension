@@ -1,5 +1,4 @@
 import copy
-import glob
 import inspect
 import json
 import os
@@ -22,7 +21,7 @@ from comfyui_to_python_utils import (
 )
 
 add_comfyui_directory_to_sys_path()
-from nodes import NODE_CLASS_MAPPINGS
+from nodes import NODE_CLASS_MAPPINGS  # noqa: E402
 
 
 DEFAULT_INPUT_FILE = "workflow_api.json"
@@ -106,7 +105,7 @@ class LoadOrderDeterminer:
         self.node_class_mappings = node_class_mappings
         self.visited = {}
         self.load_order = []
-        self.is_special_function = False
+        self.in_progress = set()
 
     def determine_load_order(self) -> List[Tuple[str, Dict, bool]]:
         """Determine the load order for the given data.
@@ -115,42 +114,59 @@ class LoadOrderDeterminer:
             List[Tuple[str, Dict, bool]]: A list of tuples representing the load order.
         """
         self._load_special_functions_first()
-        self.is_special_function = False
         for key in self.data:
             if key not in self.visited:
-                self._dfs(key)
+                self._dfs(key, is_special_function=False)
         return self.load_order
 
-    def _dfs(self, key: str) -> None:
+    def _dfs(self, key: str, is_special_function: bool) -> None:
         """Depth-First Search function to determine the load order.
 
         Args:
             key (str): The key from which to start the DFS.
+            is_special_function (bool): Whether this node is part of a special function chain.
 
         Returns:
             None
         """
-        # Mark the node as visited.
+        # Detect cycles
+        if key in self.in_progress:
+            raise ValueError(f"Cycle detected in workflow graph at node '{key}'")
+
+        # Mark the node as in-progress for cycle detection, and as visited.
+        self.in_progress.add(key)
         self.visited[key] = True
         inputs = self.data[key]["inputs"]
         # Loop over each input key.
         for input_key, val in inputs.items():
             # If the value is a list and the first item in the list has not been visited yet,
             # then recursively apply DFS on the dependency.
-            if isinstance(val, list) and val[0] not in self.visited:
-                self._dfs(val[0])
+            if isinstance(val, list):
+                if val[0] not in self.data:
+                    raise ValueError(
+                        f"Node '{key}' references non-existent node '{val[0]}'"
+                    )
+                if val[0] not in self.visited:
+                    self._dfs(val[0], is_special_function)
         # Add the key and its corresponding data to the load order list.
-        self.load_order.append((key, self.data[key], self.is_special_function))
+        self.load_order.append((key, self.data[key], is_special_function))
+        self.in_progress.discard(key)
 
     def _load_special_functions_first(self) -> None:
-        """Load functions without dependencies, loaderes, and encoders first.
+        """Load functions without dependencies, loaders, and encoders first.
 
         Returns:
             None
         """
         # Iterate over each key in the data to check for loader keys.
         for key in self.data:
-            class_def = self.node_class_mappings[self.data[key]["class_type"]]()
+            class_type = self.data[key]["class_type"]
+            if class_type not in self.node_class_mappings:
+                raise ValueError(
+                    f"Unknown node class type '{class_type}' for node '{key}'. "
+                    "Make sure the required custom node is installed."
+                )
+            class_def = self.node_class_mappings[class_type]()
             # Check if the class is a loader class or meets specific conditions.
             if (
                 class_def.CATEGORY == "loaders"
@@ -159,10 +175,9 @@ class LoadOrderDeterminer:
                     isinstance(val, list) for val in self.data[key]["inputs"].values()
                 )
             ):
-                self.is_special_function = True
                 # If the key has not been visited, perform a DFS from that key.
                 if key not in self.visited:
-                    self._dfs(key)
+                    self._dfs(key, is_special_function=True)
 
 
 class CodeGenerator:
@@ -326,7 +341,7 @@ class CodeGenerator:
 
         return code
 
-    def format_arg(self, key: str, value: any) -> str:
+    def format_arg(self, key: str, value: Any) -> str:
         """Formats arguments based on key and value.
 
         Args:
@@ -339,8 +354,7 @@ class CodeGenerator:
         if key == "noise_seed" or key == "seed":
             return f"{key}=random.randint(1, 2**64)"
         elif isinstance(value, str):
-            value = value.replace("\n", "\\n").replace('"', "'")
-            return f'{key}="{value}"'
+            return f"{key}={repr(value)}"
         elif isinstance(value, dict) and "variable_name" in value:
             return f'{key}={value["variable_name"]}'
         return f"{key}={value}"
@@ -348,7 +362,7 @@ class CodeGenerator:
     def assemble_python_code(
         self,
         import_statements: set,
-        speical_functions_code: List[str],
+        special_functions_code: List[str],
         code: List[str],
         queue_size: int,
         custom_nodes=False,
@@ -357,7 +371,7 @@ class CodeGenerator:
 
         Args:
             import_statements (set): A set of unique import statements.
-            speical_functions_code (List[str]): A list of special functions code strings.
+            special_functions_code (List[str]): A list of special functions code strings.
             code (List[str]): A list of code strings.
             queue_size (int): Number of photos that will be generated by the script.
             custom_nodes (bool): Whether to include custom nodes in the code.
@@ -400,7 +414,7 @@ class CodeGenerator:
         main_function_code = (
             "def main():\n\t"
             + f"{custom_nodes}with torch.inference_mode():\n\t\t"
-            + "\n\t\t".join(speical_functions_code)
+            + "\n\t\t".join(special_functions_code)
             + f"\n\n\t\tfor q in range({queue_size}):\n\t\t"
             + "\n\t\t".join(code)
         )
@@ -449,6 +463,9 @@ class CodeGenerator:
 
         # Remove characters that are not letters, numbers, or underscores
         clean_name = re.sub(r"[^a-z0-9_]", "", clean_name)
+
+        if not clean_name:
+            clean_name = "_unnamed"
 
         # Ensure that it doesn't start with a number
         if clean_name[0].isdigit():
@@ -609,7 +626,7 @@ def run(
 def main() -> None:
     """Main function to generate Python code from a ComfyUI workflow_api.json file."""
     parser = ArgumentParser(
-        description="Generate Python    code from a ComfyUI workflow_api.json file."
+        description="Generate Python code from a ComfyUI workflow_api.json file."
     )
     parser.add_argument(
         "-f",

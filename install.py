@@ -14,7 +14,7 @@ installed_packages = set([package.split(" ")[0].lower() for package in installed
 
 for requirement in requirements:
     if requirement.lower() not in installed_packages:
-        print(f"Installing requirements...")
+        print("Installing requirements...")
         Popen([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], stdout=PIPE, stderr=PIPE, cwd=os.path.dirname(__file__)).communicate()
-        print(f"Installed.")
+        print("Installed.")
         break
